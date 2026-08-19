@@ -1,0 +1,60 @@
+[package]
+name = "rule"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+cli = ["dep:clap", "dep:feedback-api", "dep:memory-kernel", "dep:rule-api", "dep:serde_json", "dep:spec-api", "dep:thiserror", "dep:ticket-api", "dep:toon-format", "dep:uuid"]
+mcp = ["dep:memory-kernel", "dep:rmcp", "dep:rule-api", "dep:serde", "dep:serde_json", "dep:spec-api", "dep:tokio", "dep:tracing", "dep:tracing-subscriber"]
+
+[[bin]]
+name = "rule"
+path = "src/bin/rule.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "rule-mcp"
+path = "src/bin/rule-mcp.rs"
+required-features = ["mcp"]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rule-api = { path = "crates/rule-api", optional = true }
+memory-kernel = { git = "https://github.com/mankinskin/memory-kernel", branch = "main", optional = true }
+feedback-api = { git = "https://github.com/mankinskin/memory-api", branch = "main", optional = true }
+ticket-api = { git = "https://github.com/mankinskin/ticket", branch = "main", optional = true }
+spec-api = { git = "https://github.com/mankinskin/spec", branch = "main", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+rmcp = { version = "0.14", features = ["server", "transport-io"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+thiserror = { version = "2", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+toon-format = { version = "0.5", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+uuid = { version = "1", features = ["serde", "v4"], optional = true }
+
+[dev-dependencies]
+memory-fixtures = { git = "https://github.com/mankinskin/memory-fixtures", branch = "main" }
+pretty_assertions = "1"
+tempfile = "3"
+
+[[test]]
+name = "install_contract_sync"
+path = "tests/install_contract_sync.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "toon_output"
+path = "tests/toon_output.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "smoke_test"
+path = "tests/smoke_test.rs"
+required-features = ["mcp"]
