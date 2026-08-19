@@ -45,11 +45,6 @@ pretty_assertions = "1"
 tempfile = "3"
 
 [[test]]
-name = "install_contract_sync"
-path = "tests/install_contract_sync.rs"
-required-features = ["cli"]
-
-[[test]]
 name = "toon_output"
 path = "tests/toon_output.rs"
 required-features = ["cli"]
