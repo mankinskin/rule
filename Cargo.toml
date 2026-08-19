@@ -25,7 +25,7 @@ path = "src/lib.rs"
 [dependencies]
 rule-api = { path = "crates/rule-api", optional = true }
 memory-kernel = { git = "https://github.com/mankinskin/memory-kernel", branch = "main", optional = true }
-feedback-api = { git = "https://github.com/mankinskin/memory-api", branch = "main", optional = true }
+feedback-api = { git = "https://github.com/mankinskin/feedback", branch = "main", optional = true }
 ticket-api = { git = "https://github.com/mankinskin/ticket", branch = "main", optional = true }
 spec-api = { git = "https://github.com/mankinskin/spec", branch = "main", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
