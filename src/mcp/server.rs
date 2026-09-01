@@ -399,7 +399,7 @@ pub async fn run_mcp_server(
 mod tests {
     #[test]
     fn workspace_validation_rejects_ambient_aliases() {
-        for value in [None, Some(""), Some("default"), Some("."), Some("..")] {
+        for value in [None, Some(""), Some("default"), Some("..")] {
             let err =
                 memory_kernel::workspace::validate_explicit_workspace_selector(
                     value,
@@ -417,5 +417,13 @@ mod tests {
                 "error should state the requirement: {err_msg}"
             );
         }
+    }
+
+    #[test]
+    fn workspace_validation_accepts_current_directory() {
+        memory_kernel::workspace::validate_explicit_workspace_selector(Some(
+            ".",
+        ))
+        .expect("'.' should resolve to the MCP server's cwd");
     }
 }

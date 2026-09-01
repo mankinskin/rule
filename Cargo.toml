@@ -7,7 +7,7 @@ publish = false
 [features]
 default = []
 cli = ["dep:clap", "dep:feedback-api", "dep:memory-kernel", "dep:rule-api", "dep:serde_json", "dep:spec-api", "dep:thiserror", "dep:ticket-api", "dep:toon-format", "dep:uuid"]
-mcp = ["dep:memory-kernel", "dep:rmcp", "dep:rule-api", "dep:serde", "dep:serde_json", "dep:spec-api", "dep:tokio", "dep:tracing", "dep:tracing-subscriber"]
+mcp = ["dep:memory-kernel", "dep:rmcp", "dep:rule-api", "dep:serde", "dep:serde_json", "dep:spec-api", "dep:tokio", "dep:tracing", "dep:tracing-subscriber", "dep:uuid"]
 
 [[bin]]
 name = "rule"
