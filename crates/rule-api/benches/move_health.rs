@@ -28,202 +28,36 @@
 //! from "crossing", where the edge points at a separate external pool that
 //! never participates as a moved candidate.
 
-use std::{
-    fs,
-    path::{
-        Path,
-        PathBuf,
-    },
-    process::Command,
-};
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use criterion::{
-    BatchSize,
-    Criterion,
-    criterion_group,
-    criterion_main,
-};
+use criterion::{Criterion, criterion_group, criterion_main};
 use memory_kernel::{
     model::edge::EdgeRecord,
-    storage::move_kernel::{
-        MoveBlocker,
-        MoveExecutionPhase,
-        MovePlan,
+    storage::move_kernel::{MoveExecutionPhase, MovePlan},
+    testing::{
+        MoveBenchmarkWorkspace, drop_fixture_blockers, iter_move_benchmark, move_bench_criterion,
     },
 };
-use rule_api::{
-    manifest::RuleManifest,
-    store::RuleStore,
-};
-use tempfile::TempDir;
+use rule_api::{manifest::RuleManifest, store::RuleStore};
 use uuid::Uuid;
 
-fn git_init(repo_root: &Path) {
-    let status = Command::new("git")
-        .current_dir(repo_root)
-        .arg("init")
-        .status()
-        .expect("run git init");
-    assert!(status.success(), "git init failed");
-}
-
-/// Link topology between the moved rule(s) and the rest of the fixture.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum LinkTopology {
-    /// No edges at all.
-    None,
-    /// Edges from each moved rule to other rules in the same moved-candidate
-    /// pool (never a separate external pool).
-    Internal,
-    /// Edges from each moved rule to a fixed, separate external pool that
-    /// never participates as a moved candidate.
-    Crossing,
-}
-
-const CROSSING_EXTERNAL_POOL: usize = 20;
-
-/// One isolated source+target workspace pair with `moved_count` moved rules,
-/// `background_count` unrelated rules already in the source store (used to
-/// vary total store size independent of the moved batch), and `density`
-/// edges per moved rule under the given `topology`.
-fn build_rule_fixture(
-    moved_count: usize,
-    topology: LinkTopology,
-    density: usize,
-    background_count: usize,
-) -> (TempDir, RuleStore, PathBuf, Vec<Uuid>) {
-    let workspace_dir = tempfile::tempdir().expect("tempdir");
-    let repo = workspace_dir.path().join("repo");
-    fs::create_dir_all(&repo).expect("create repo dir");
-    git_init(&repo);
-
-    let source_workspace = repo.join("source");
-    let target_workspace = repo.join("target");
-    fs::create_dir_all(&source_workspace).expect("create source workspace");
-    fs::create_dir_all(&target_workspace).expect("create target workspace");
-
-    let mut source_store =
-        RuleStore::init(&source_workspace).expect("init source store");
-    RuleStore::init(&target_workspace).expect("init target store");
-
-    let moved_ids: Vec<Uuid> = (0..moved_count)
-        .map(|offset| {
-            let manifest = RuleManifest::new(
-                &format!("bench/moved-{offset}"),
-                &format!("Moved rule {offset}"),
-                "agents",
-                "main",
-                "moved rule body",
-            );
-            source_store
-                .create(&manifest, None)
-                .expect("create moved rule")
-        })
-        .collect();
-
-    let external_ids: Vec<Uuid> =
-        if topology == LinkTopology::Crossing && density > 0 {
-            (0..CROSSING_EXTERNAL_POOL)
-                .map(|offset| {
-                    let manifest = RuleManifest::new(
-                        &format!("bench/external-{offset}"),
-                        &format!("External rule {offset}"),
-                        "agents",
-                        "main",
-                        "external rule body",
-                    );
-                    source_store
-                        .create(&manifest, None)
-                        .expect("create external rule")
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-    for offset in 0..background_count {
-        let manifest = RuleManifest::new(
-            &format!("bench/background-{offset}"),
-            &format!("Background rule {offset}"),
-            "agents",
-            "main",
-            "background rule body",
-        );
-        source_store
-            .create(&manifest, None)
-            .expect("create background rule");
-    }
-
-    if density > 0 {
-        let now = Utc::now();
-        match topology {
-            LinkTopology::None => {},
-            LinkTopology::Crossing => {
-                let crossing_density = density.min(external_ids.len());
-                for (idx, moved_id) in moved_ids.iter().enumerate() {
-                    for step in 0..crossing_density {
-                        let target_idx = (idx + step) % external_ids.len();
-                        source_store
-                            .entity_store()
-                            .add_edge(EdgeRecord {
-                                from: *moved_id,
-                                to: external_ids[target_idx],
-                                kind: "linked".to_string(),
-                                created_at: now,
-                            })
-                            .expect("add crossing edge");
-                    }
-                }
-            },
-            LinkTopology::Internal => {
-                // Distinct partners available per moved rule, excluding itself.
-                let available_partners = moved_ids.len().saturating_sub(1);
-                let internal_density = density.min(available_partners);
-                for (idx, moved_id) in moved_ids.iter().enumerate() {
-                    for step in 0..internal_density {
-                        // Skip self by offsetting by one before wrapping.
-                        let target_idx =
-                            (idx + step + 1) % moved_ids.len();
-                        source_store
-                            .entity_store()
-                            .add_edge(EdgeRecord {
-                                from: *moved_id,
-                                to: moved_ids[target_idx],
-                                kind: "linked".to_string(),
-                                created_at: now,
-                            })
-                            .expect("add internal edge");
-                    }
-                }
-            },
-        }
-    }
-
-    source_store.scan(true).expect("scan source store");
-
-    (workspace_dir, source_store, target_workspace, moved_ids)
-}
+mod move_health_fixture;
+use move_health_fixture::{LinkTopology, build_rule_fixture};
 
 /// Build a supported preflight plan for `id`, dropping the blockers that are
 /// expected artifacts of the isolated bench fixture rather than genuine
 /// domain conflicts (mirrors the existing rule move unit tests).
-fn active_move_plan(
-    store: &RuleStore,
-    target_root: &Path,
-    id: &Uuid,
-) -> MovePlan {
+fn active_move_plan(store: &RuleStore, target_root: &Path, id: &Uuid) -> MovePlan {
     let mut plan = store
         .plan_move_preflight(id, target_root)
         .expect("plan preflight");
-    plan.blockers.retain(|blocker| {
-        !matches!(
-            blocker,
-            MoveBlocker::PathReferenceScanUnavailable { .. }
-                | MoveBlocker::DirtyTrackedFiles { .. }
-        )
-    });
-    assert!(plan.supported(), "unexpected move blockers: {:?}", plan.blockers);
+    drop_fixture_blockers(&mut plan);
+    assert!(
+        plan.supported(),
+        "unexpected move blockers: {:?}",
+        plan.blockers
+    );
     plan
 }
 
@@ -231,20 +65,18 @@ fn active_move_plan(
 
 fn bench_rule_move_preflight_by_entity_count(c: &mut Criterion) {
     for &moved_count in &[1usize, 25, 100, 500] {
-        let (_workspace_dir, store, target_root, ids) =
-            build_rule_fixture(moved_count, LinkTopology::None, 0, 0);
+        let workspace = MoveBenchmarkWorkspace::new();
+        let (store, target_root, ids) =
+            build_rule_fixture(&workspace, moved_count, LinkTopology::None, 0, 0);
         let id = ids[0];
-        c.bench_function(
-            &format!("rule_move_preflight_{moved_count}entities"),
-            |b| {
-                b.iter(|| {
-                    let plan = store
-                        .plan_move_preflight(&id, &target_root)
-                        .expect("plan preflight");
-                    criterion::black_box(plan);
-                });
-            },
-        );
+        c.bench_function(&format!("rule_move_preflight_{moved_count}entities"), |b| {
+            b.iter(|| {
+                let plan = store
+                    .plan_move_preflight(&id, &target_root)
+                    .expect("plan preflight");
+                criterion::black_box(plan);
+            });
+        });
     }
 }
 
@@ -257,8 +89,9 @@ fn bench_rule_move_preflight_by_link_density(c: &mut Criterion) {
         (LinkTopology::Crossing, "crossing"),
     ] {
         for &density in &[1usize, 5, 20] {
-            let (_workspace_dir, store, target_root, ids) =
-                build_rule_fixture(MOVED_COUNT, topology, density, 0);
+            let workspace = MoveBenchmarkWorkspace::new();
+            let (store, target_root, ids) =
+                build_rule_fixture(&workspace, MOVED_COUNT, topology, density, 0);
             let id = ids[0];
             c.bench_function(
                 &format!("rule_move_preflight_{label}_{density}links"),
@@ -278,46 +111,68 @@ fn bench_rule_move_preflight_by_link_density(c: &mut Criterion) {
 // --- Phase separation ---
 
 fn bench_rule_move_preflight_only(c: &mut Criterion) {
+    let workspace = MoveBenchmarkWorkspace::new();
+    let (store, target_root, ids) = build_rule_fixture(&workspace, 1, LinkTopology::None, 0, 0);
+    let id = ids[0];
     c.bench_function("rule_move_phase_preflight_only", |b| {
-        b.iter_batched(
-            || build_rule_fixture(1, LinkTopology::None, 0, 0),
-            |(_workspace_dir, store, target_root, ids)| {
-                let plan = store
-                    .plan_move_preflight(&ids[0], &target_root)
-                    .expect("plan preflight");
-                criterion::black_box(plan);
-            },
-            BatchSize::SmallInput,
-        );
+        b.iter(|| {
+            let plan = store
+                .plan_move_preflight(&id, &target_root)
+                .expect("plan preflight");
+            criterion::black_box(plan);
+        });
     });
 }
 
 fn bench_rule_move_apply_only(c: &mut Criterion) {
+    let workspace = MoveBenchmarkWorkspace::new();
     c.bench_function("rule_move_phase_apply_only", |b| {
-        b.iter_batched(
+        iter_move_benchmark(
+            b,
             || {
-                let (workspace_dir, store, target_root, ids) =
-                    build_rule_fixture(1, LinkTopology::None, 0, 0);
+                let (store, target_root, ids) =
+                    build_rule_fixture(&workspace, 1, LinkTopology::None, 0, 0);
                 let plan = active_move_plan(&store, &target_root, &ids[0]);
-                (workspace_dir, store, plan)
+                (store, plan)
             },
-            |(_workspace_dir, store, plan)| {
+            |(store, plan)| {
                 let outcome = store
                     .execute_move_with_journal(&plan)
                     .expect("execute move");
                 assert_eq!(outcome.journal.phase, MoveExecutionPhase::Validated);
                 criterion::black_box(outcome);
             },
-            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn bench_rule_move_set_preflight(c: &mut Criterion) {
+    let workspace = MoveBenchmarkWorkspace::new();
+    c.bench_function("rule_move_set_preflight_2entities", |b| {
+        iter_move_benchmark(
+            b,
+            || {
+                let (store, target_root, ids) =
+                    build_rule_fixture(&workspace, 1, LinkTopology::None, 0, 0);
+                (store, target_root, ids)
+            },
+            |(store, target_root, ids)| {
+                let plan = store
+                    .plan_move_set(&ids, &target_root)
+                    .expect("plan move set");
+                criterion::black_box(plan);
+            },
         );
     });
 }
 
 fn bench_rule_move_preflight_plus_apply(c: &mut Criterion) {
+    let workspace = MoveBenchmarkWorkspace::new();
     c.bench_function("rule_move_phase_preflight_plus_apply", |b| {
-        b.iter_batched(
-            || build_rule_fixture(1, LinkTopology::None, 0, 0),
-            |(_workspace_dir, store, target_root, ids)| {
+        iter_move_benchmark(
+            b,
+            || build_rule_fixture(&workspace, 1, LinkTopology::None, 0, 0),
+            |(store, target_root, ids)| {
                 let plan = active_move_plan(&store, &target_root, &ids[0]);
                 let outcome = store
                     .execute_move_with_journal(&plan)
@@ -325,31 +180,31 @@ fn bench_rule_move_preflight_plus_apply(c: &mut Criterion) {
                 assert_eq!(outcome.journal.phase, MoveExecutionPhase::Validated);
                 criterion::black_box(outcome);
             },
-            BatchSize::SmallInput,
         );
     });
 }
 
 fn bench_rule_move_rollback(c: &mut Criterion) {
+    let workspace = MoveBenchmarkWorkspace::new();
     c.bench_function("rule_move_phase_rollback", |b| {
-        b.iter_batched(
+        iter_move_benchmark(
+            b,
             || {
-                let (workspace_dir, store, target_root, ids) =
-                    build_rule_fixture(1, LinkTopology::None, 0, 0);
+                let (store, target_root, ids) =
+                    build_rule_fixture(&workspace, 1, LinkTopology::None, 0, 0);
                 let plan = active_move_plan(&store, &target_root, &ids[0]);
                 let outcome = store
                     .execute_move_with_journal(&plan)
                     .expect("execute move");
-                (workspace_dir, store, outcome.journal.id)
+                (store, outcome.journal.id)
             },
-            |(_workspace_dir, store, journal_id)| {
+            |(store, journal_id)| {
                 let outcome = store
                     .rollback_move_with_journal(journal_id)
                     .expect("rollback move");
                 assert!(outcome.rolled_back);
                 criterion::black_box(outcome);
             },
-            BatchSize::SmallInput,
         );
     });
 }
@@ -359,24 +214,25 @@ fn bench_rule_move_rollback(c: &mut Criterion) {
 /// public move API cannot synthesize a genuinely-interrupted move. See the
 /// module doc comment.
 fn bench_rule_move_resume_idempotent_proxy(c: &mut Criterion) {
+    let workspace = MoveBenchmarkWorkspace::new();
     c.bench_function("rule_move_phase_resume_idempotent_proxy", |b| {
-        b.iter_batched(
+        iter_move_benchmark(
+            b,
             || {
-                let (workspace_dir, store, target_root, ids) =
-                    build_rule_fixture(1, LinkTopology::None, 0, 0);
+                let (store, target_root, ids) =
+                    build_rule_fixture(&workspace, 1, LinkTopology::None, 0, 0);
                 let plan = active_move_plan(&store, &target_root, &ids[0]);
                 let outcome = store
                     .execute_move_with_journal(&plan)
                     .expect("execute move");
-                (workspace_dir, store, outcome.journal.id)
+                (store, outcome.journal.id)
             },
-            |(_workspace_dir, store, journal_id)| {
+            |(store, journal_id)| {
                 let outcome = store
                     .resume_move_with_journal(journal_id)
                     .expect("resume move");
                 criterion::black_box(outcome);
             },
-            BatchSize::SmallInput,
         );
     });
 }
@@ -393,41 +249,44 @@ fn bench_rule_move_apply_by_store_size(c: &mut Criterion) {
     const DENSITY: usize = 5;
     for &background_count in &[10usize, 100, 400] {
         let total_store_size = MOVED_COUNT + background_count;
+        let workspace = MoveBenchmarkWorkspace::new();
         c.bench_function(
             &format!("rule_move_apply_store_size_{total_store_size}rules"),
             |b| {
-                b.iter_batched(
+                iter_move_benchmark(
+                    b,
                     || {
-                        let (workspace_dir, store, target_root, ids) =
-                            build_rule_fixture(
-                                MOVED_COUNT,
-                                LinkTopology::Crossing,
-                                DENSITY,
-                                background_count,
-                            );
-                        let plan =
-                            active_move_plan(&store, &target_root, &ids[0]);
-                        (workspace_dir, store, plan)
+                        let (store, target_root, ids) = build_rule_fixture(
+                            &workspace,
+                            MOVED_COUNT,
+                            LinkTopology::Crossing,
+                            DENSITY,
+                            background_count,
+                        );
+                        let plan = active_move_plan(&store, &target_root, &ids[0]);
+                        (store, plan)
                     },
-                    |(_workspace_dir, store, plan)| {
+                    |(store, plan)| {
                         let outcome = store
                             .execute_move_with_journal(&plan)
                             .expect("execute move");
-                        assert_eq!(
-                            outcome.journal.phase,
-                            MoveExecutionPhase::Validated
-                        );
+                        assert_eq!(outcome.journal.phase, MoveExecutionPhase::Validated);
                         criterion::black_box(outcome);
                     },
-                    BatchSize::SmallInput,
                 );
             },
         );
     }
 }
 
+fn criterion_config() -> Criterion {
+    move_bench_criterion()
+}
+
 criterion_group!(
-    move_health,
+    name = move_health;
+    config = criterion_config();
+    targets =
     bench_rule_move_preflight_by_entity_count,
     bench_rule_move_preflight_by_link_density,
     bench_rule_move_preflight_only,
@@ -436,5 +295,6 @@ criterion_group!(
     bench_rule_move_rollback,
     bench_rule_move_resume_idempotent_proxy,
     bench_rule_move_apply_by_store_size,
+    bench_rule_move_set_preflight
 );
 criterion_main!(move_health);

@@ -5,29 +5,21 @@
 //! without copying any move logic. Rules have no board or lease model, so the
 //! kernel's default no-op board/lease hooks apply.
 
-use std::path::{
-    Path,
-    PathBuf,
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
 };
 
 use memory_kernel::{
     error::StorageError,
     storage::move_kernel::{
-        self,
-        MoveDomain,
-        MoveError,
-        MoveOutcome,
-        MovePlan,
-        MoveReferences,
-        MoveResult,
+        self, MoveDomain, MoveError, MoveOutcome, MovePlan, MoveReferences, MoveResult,
+        MoveSetOutcome, MoveSetPlan,
     },
 };
 use uuid::Uuid;
 
-use crate::{
-    error::RuleError,
-    store::RuleStore,
-};
+use crate::{error::RuleError, store::RuleStore};
 
 const RULE_INDEX_DIR: &str = ".rule";
 
@@ -39,18 +31,13 @@ fn to_move_error(error: RuleError) -> MoveError {
 }
 
 fn rule_entity_root(store_root: &Path) -> PathBuf {
-    memory_kernel::workspace::resolve_store_root_from(
-        store_root,
-        RULE_INDEX_DIR,
-    )
-    .join("rules")
+    memory_kernel::workspace::resolve_store_root_from(store_root, RULE_INDEX_DIR).join("rules")
 }
 
 fn from_move_error(error: MoveError) -> RuleError {
     match error {
         MoveError::Io(io) => RuleError::Storage(StorageError::Io(io)),
-        MoveError::Domain(message) =>
-            RuleError::Storage(StorageError::Other(message)),
+        MoveError::Domain(message) => RuleError::Storage(StorageError::Other(message)),
         MoveError::InteroperabilityContract {
             artifact_class,
             detail,
@@ -84,10 +71,7 @@ impl MoveDomain for RuleMoveDomain<'_> {
         self.store.entity_store().index_root.clone()
     }
 
-    fn source_entity_path(
-        &self,
-        entity_id: &Uuid,
-    ) -> MoveResult<Option<PathBuf>> {
+    fn source_entity_path(&self, entity_id: &Uuid) -> MoveResult<Option<PathBuf>> {
         Ok(self
             .store
             .entity_store()
@@ -96,10 +80,7 @@ impl MoveDomain for RuleMoveDomain<'_> {
             .map(|entity| entity.path))
     }
 
-    fn related_entities(
-        &self,
-        entity_id: &Uuid,
-    ) -> MoveResult<MoveReferences> {
+    fn related_entities(&self, entity_id: &Uuid) -> MoveResult<MoveReferences> {
         let mut references = MoveReferences::default();
         for edge in self
             .store
@@ -117,24 +98,39 @@ impl MoveDomain for RuleMoveDomain<'_> {
         Ok(references)
     }
 
-    fn target_store_present(
+    fn related_entities_for_set(
         &self,
-        target_store_root: &Path,
-    ) -> MoveResult<bool> {
+        entity_ids: &[Uuid],
+    ) -> MoveResult<BTreeMap<Uuid, MoveReferences>> {
+        let mut references = entity_ids
+            .iter()
+            .map(|entity_id| (*entity_id, MoveReferences::default()))
+            .collect::<BTreeMap<_, _>>();
+        for edge in self
+            .store
+            .entity_store()
+            .list_all_edges()
+            .map_err(|error| to_move_error(error.into()))?
+        {
+            if let Some(entry) = references.get_mut(&edge.from) {
+                entry.outbound.push(edge.to);
+            }
+            if let Some(entry) = references.get_mut(&edge.to) {
+                entry.inbound.push(edge.from);
+            }
+        }
+        Ok(references)
+    }
+
+    fn target_store_present(&self, target_store_root: &Path) -> MoveResult<bool> {
         match RuleStore::open(target_store_root) {
             Ok(_) => Ok(true),
-            Err(RuleError::Storage(StorageError::WorkspaceNotFound {
-                ..
-            })) => Ok(false),
+            Err(RuleError::Storage(StorageError::WorkspaceNotFound { .. })) => Ok(false),
             Err(error) => Err(to_move_error(error)),
         }
     }
 
-    fn entity_indexed_in(
-        &self,
-        store_root: &Path,
-        entity_id: &Uuid,
-    ) -> MoveResult<bool> {
+    fn entity_indexed_in(&self, store_root: &Path, entity_id: &Uuid) -> MoveResult<bool> {
         let store = RuleStore::open(store_root).map_err(to_move_error)?;
         let entity_root = rule_entity_root(store_root);
         Ok(store
@@ -145,10 +141,33 @@ impl MoveDomain for RuleMoveDomain<'_> {
             .unwrap_or(false))
     }
 
-    fn scan_store(
+    fn entity_indexed_in_many(
         &self,
         store_root: &Path,
-    ) -> MoveResult<()> {
+        entity_ids: &[Uuid],
+    ) -> MoveResult<BTreeMap<Uuid, bool>> {
+        let store = RuleStore::open(store_root).map_err(to_move_error)?;
+        let entity_root = rule_entity_root(store_root);
+        let indexed = store
+            .entity_store()
+            .list_indexed()
+            .map_err(|error| to_move_error(error.into()))?;
+        let indexed_paths = indexed
+            .into_iter()
+            .map(|entity| (entity.id, entity.path.starts_with(&entity_root)))
+            .collect::<BTreeMap<_, _>>();
+        Ok(entity_ids
+            .iter()
+            .map(|entity_id| {
+                (
+                    *entity_id,
+                    indexed_paths.get(entity_id).copied().unwrap_or(false),
+                )
+            })
+            .collect())
+    }
+
+    fn scan_store(&self, store_root: &Path) -> MoveResult<()> {
         let mut store = RuleStore::open(store_root).map_err(to_move_error)?;
         store.scan(true).map_err(to_move_error)?;
         Ok(())
@@ -156,6 +175,23 @@ impl MoveDomain for RuleMoveDomain<'_> {
 }
 
 impl RuleStore {
+    /// Build one normalized preflight plan for a set of rules.
+    pub fn plan_move_set(
+        &self,
+        rule_ids: &[Uuid],
+        target_workspace_root: &Path,
+    ) -> Result<MoveSetPlan, RuleError> {
+        let domain = RuleMoveDomain::new(self);
+        move_kernel::plan_move_set(&domain, rule_ids, target_workspace_root)
+            .map_err(from_move_error)
+    }
+
+    /// Execute a supported normalized set move with one shared lock lifecycle.
+    pub fn execute_move_set(&self, plan: &MoveSetPlan) -> Result<MoveSetOutcome, RuleError> {
+        let domain = RuleMoveDomain::new(self);
+        move_kernel::execute_move_set(&domain, plan).map_err(from_move_error)
+    }
+
     /// Build a read-only preflight plan for moving a rule to
     /// `target_workspace_root`, reusing the domain-neutral move kernel.
     pub fn plan_move_preflight(
@@ -164,33 +200,23 @@ impl RuleStore {
         target_workspace_root: &Path,
     ) -> Result<MovePlan, RuleError> {
         let domain = RuleMoveDomain::new(self);
-        move_kernel::plan_move(&domain, rule_id, target_workspace_root)
-            .map_err(from_move_error)
+        move_kernel::plan_move(&domain, rule_id, target_workspace_root).map_err(from_move_error)
     }
 
     /// Execute a supported rule move with a fresh journal.
-    pub fn execute_move_with_journal(
-        &self,
-        plan: &MovePlan,
-    ) -> Result<MoveOutcome, RuleError> {
+    pub fn execute_move_with_journal(&self, plan: &MovePlan) -> Result<MoveOutcome, RuleError> {
         let domain = RuleMoveDomain::new(self);
         move_kernel::execute_move(&domain, plan).map_err(from_move_error)
     }
 
     /// Resume an interrupted rule move from its journal id.
-    pub fn resume_move_with_journal(
-        &self,
-        journal_id: Uuid,
-    ) -> Result<MoveOutcome, RuleError> {
+    pub fn resume_move_with_journal(&self, journal_id: Uuid) -> Result<MoveOutcome, RuleError> {
         let domain = RuleMoveDomain::new(self);
         move_kernel::resume_move(&domain, journal_id).map_err(from_move_error)
     }
 
     /// Roll back a rule move from its journal id.
-    pub fn rollback_move_with_journal(
-        &self,
-        journal_id: Uuid,
-    ) -> Result<MoveOutcome, RuleError> {
+    pub fn rollback_move_with_journal(&self, journal_id: Uuid) -> Result<MoveOutcome, RuleError> {
         let domain = RuleMoveDomain::new(self);
         move_kernel::rollback_move(&domain, journal_id).map_err(from_move_error)
     }
@@ -201,19 +227,12 @@ mod tests {
     use super::*;
     use memory_kernel::{
         model::edge::EdgeRecord,
-        storage::move_kernel::{
-            MoveBlocker,
-            MoveExecutionPhase,
-            MoveReferenceDirection,
-        },
+        storage::move_kernel::{MoveBlocker, MoveExecutionPhase, MoveReferenceDirection},
     };
     use std::process::Command;
     use tempfile::tempdir;
 
-    fn run_git(
-        repo_root: &Path,
-        args: &[&str],
-    ) {
+    fn run_git(repo_root: &Path, args: &[&str]) {
         let status = Command::new("git")
             .current_dir(repo_root)
             .args(args)
@@ -319,9 +338,11 @@ mod tests {
                 && entry.direction == MoveReferenceDirection::Outbound
                 && !entry.visible_from_destination
         }));
-        assert!(!plan.blockers.iter().any(|blocker| matches!(
-            blocker,
-            MoveBlocker::InvisibleReference { .. }
-        )));
+        assert!(
+            !plan
+                .blockers
+                .iter()
+                .any(|blocker| matches!(blocker, MoveBlocker::InvisibleReference { .. }))
+        );
     }
 }
