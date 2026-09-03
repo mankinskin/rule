@@ -19,3 +19,8 @@ tracing = "0.1"
 [dev-dependencies]
 pretty_assertions = "1"
 tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "move_health"
+harness = false
