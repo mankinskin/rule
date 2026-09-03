@@ -80,6 +80,22 @@ impl MoveDomain for RuleMoveDomain<'_> {
             .map(|entity| entity.path))
     }
 
+    fn source_entity_paths_for_set(
+        &self,
+        entity_ids: &[Uuid],
+    ) -> MoveResult<BTreeMap<Uuid, PathBuf>> {
+        let requested = entity_ids.iter().copied().collect::<std::collections::BTreeSet<_>>();
+        Ok(self
+            .store
+            .entity_store()
+            .list_indexed()
+            .map_err(|error| to_move_error(error.into()))?
+            .into_iter()
+            .filter(|entity| requested.contains(&entity.id))
+            .map(|entity| (entity.id, entity.path))
+            .collect())
+    }
+
     fn related_entities(&self, entity_id: &Uuid) -> MoveResult<MoveReferences> {
         let mut references = MoveReferences::default();
         for edge in self
