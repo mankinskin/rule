@@ -233,8 +233,7 @@ fn missing_rule_command_relays_signal_to_ticket_and_feedback_stores() {
         ".feedback",
     );
     let feedback_store =
-        feedback_api::EntityFeedbackStore::new(feedback_store_root, "default")
-            .unwrap();
+        feedback_api::EntityFeedbackStore::new(feedback_store_root);
     let ticket_urn =
         feedback_api::EntityUrn::ticket("default", ticket_id.to_string())
             .unwrap();
